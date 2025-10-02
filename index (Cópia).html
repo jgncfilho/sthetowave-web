@@ -1,0 +1,85 @@
+<!DOCTYPE html>
+<html>
+<head>
+  <meta charset="UTF-8">
+  <meta content="width=device-width, initial-scale=1.0" name="viewport">
+  <title>Audio Filter App</title>
+  <style>
+    body {
+      margin: 0;
+      padding: 0;
+      font-family: Arial, sans-serif;
+    }
+  </style>
+</head>
+<body>
+<script>
+  // Configurações globais
+  let audioContext = null;
+  let mediaStream = null;
+
+  // Função para iniciar áudio com filtro
+  function startWebAudio() {
+    try {
+      // Criar contexto de áudio
+      audioContext = new (window.AudioContext || window.webkitAudioContext)();
+
+      // Solicitar acesso ao microfone
+      navigator.mediaDevices.getUserMedia({
+        audio: {
+          echoCancellation: false,
+          noiseSuppression: false,
+          autoGainControl: false
+        }
+      }).then(function(stream) {
+        mediaStream = stream;
+
+        // Criar fonte do microfone
+        const micSource = audioContext.createMediaStreamSource(stream);
+
+        // Criar filtro passa-alta (highpass) - acima de 150Hz
+        const highpassFilter = audioContext.createBiquadFilter();
+        highpassFilter.type = "highpass";
+        highpassFilter.frequency.value = 150;
+        highpassFilter.Q.value = 1.0;
+
+        // Conectar: microfone -> filtro -> autofalante
+        micSource.connect(highpassFilter);
+        highpassFilter.connect(audioContext.destination);
+
+        console.log("WebAudio iniciado com filtro passa-alta (150Hz)");
+      }).catch(function(error) {
+        console.error("Erro ao acessar microfone:", error);
+      });
+
+    } catch (error) {
+      console.error("Erro ao iniciar WebAudio:", error);
+    }
+  }
+
+  // Função para parar áudio
+  function stopWebAudio() {
+    try {
+      // Parar todas as tracks do stream
+      if (mediaStream) {
+        mediaStream.getTracks().forEach(track => track.stop());
+        mediaStream = null;
+      }
+
+      // Fechar contexto de áudio
+      if (audioContext) {
+        audioContext.close();
+        audioContext = null;
+      }
+
+      console.log("WebAudio parado");
+    } catch (error) {
+      console.error("Erro ao parar WebAudio:", error);
+    }
+  }
+</script>
+
+<!-- Script do Flutter -->
+<script src="main.dart.js" type="application/javascript"></script>
+</body>
+</html>

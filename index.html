@@ -1,0 +1,582 @@
+<!DOCTYPE html>
+<html>
+<head>
+  <meta charset="UTF-8">
+  <title>StethoWave Web</title>
+
+  <script>
+    // CONFIGURAÇÕES GLOBAIS
+    let audioContext = null;
+    let mediaStream = null;
+    let mediaRecorder = null;
+    let recordedChunks = [];
+    let isRecording = false;
+    let gainNode = null;
+    let sourceNode = null;
+    let analyserNode = null;
+    let audioBufferData = [];
+    let audioContextClosed = false; // NOVO: flag para controlar estado
+
+    window.stopWebRecording = function() {
+    return new Promise((resolve, reject) => {
+        try {
+            console.log("Parando gravação - AudioContext state:", audioContext?.state);
+
+            if (mediaRecorder && isRecording) {
+                mediaRecorder.stop();
+                isRecording = false;
+            }
+
+            if (mediaStream) {
+                mediaStream.getTracks().forEach(track => track.stop());
+                mediaStream = null;
+            }
+
+            if (audioContext && audioContext.state !== 'closed') {
+                audioContext.close().then(() => {
+                    audioContextClosed = true;
+                    console.log("AudioContext fechado com sucesso");
+                    resolve("success"); // ← Resolve a Promise com string
+                }).catch(error => {
+                    console.log("AudioContext já estava fechado:", error);
+                    audioContextClosed = true;
+                    resolve("success"); // ← Mesmo em erro, resolve como success
+                });
+            } else {
+                console.log("AudioContext já estava fechado ou não existe");
+                audioContextClosed = true;
+                resolve("success"); // ← Resolve a Promise
+            }
+
+            gainNode = null;
+            sourceNode = null;
+            analyserNode = null;
+
+        } catch (error) {
+            console.log("Erro em stopWebRecording:", error);
+            audioContextClosed = true;
+            resolve("success"); // ← Nunca rejeita, sempre resolve
+        }
+    });
+};
+
+window.startWebRecording = async function(lowFreq, highFreq, applyFilter) {
+    return new Promise(async (resolve, reject) => {
+        try {
+            if (audioContextClosed || !audioContext || audioContext.state === 'closed') {
+                audioContext = new (window.AudioContext || window.webkitAudioContext)({ sampleRate: 8000 });
+                audioContextClosed = false;
+            }
+
+            // Se o contexto estiver suspenso, resume (importante!)
+            if (audioContext.state === 'suspended') {
+                await audioContext.resume();
+            }
+
+            audioBufferData = [];
+
+            mediaStream = await navigator.mediaDevices.getUserMedia({
+                audio: {
+                    echoCancellation: false,
+                    noiseSuppression: false,
+                    autoGainControl: false,
+                    sampleRate: 8000,
+                    channelCount: 1
+                }
+            });
+
+            sourceNode = audioContext.createMediaStreamSource(mediaStream);
+            gainNode = audioContext.createGain();
+            gainNode.gain.value = 1.0;
+
+            analyserNode = audioContext.createAnalyser();
+            analyserNode.fftSize = 1024;
+            analyserNode.smoothingTimeConstant = 0.1;
+
+            // NÓ DE DESTINO PARA SAÍDA DE ÁUDIO
+            const destinationNode = audioContext.destination;
+
+            // SCRIPT PROCESSOR PARA CAPTURA (sem bloquear áudio)
+            const processor = audioContext.createScriptProcessor(4096, 1, 1);
+            processor.onaudioprocess = (event) => {
+                if (isRecording) {
+                    const inputData = event.inputBuffer.getChannelData(0);
+                    audioBufferData.push(new Float32Array(inputData));
+                }
+            };
+
+            // CONEXÃO CORRETA - GARANTIR QUE O ÁUDIO CHEGUE NA SAÍDA
+            if (applyFilter) {
+                const highpassFilter = audioContext.createBiquadFilter();
+                highpassFilter.type = "highpass";
+                highpassFilter.frequency.value = lowFreq;
+
+                const lowpassFilter = audioContext.createBiquadFilter();
+                lowpassFilter.type = "lowpass";
+                lowpassFilter.frequency.value = highFreq;
+
+                // Conexão principal: microfone → filtros → ganho → SAÍDA
+                sourceNode.connect(highpassFilter);
+                highpassFilter.connect(lowpassFilter);
+                lowpassFilter.connect(gainNode);
+                gainNode.connect(destinationNode); // ← CONEXÃO DIRETA COM SAÍDA
+
+                // Conexão paralela para análise
+                gainNode.connect(analyserNode);
+                analyserNode.connect(processor);
+                processor.connect(destinationNode); // ← TAMBÉM CONECTA À SAÍDA
+
+            } else {
+                // Conexão direta: microfone → ganho → SAÍDA
+                sourceNode.connect(gainNode);
+                gainNode.connect(destinationNode); // ← CONEXÃO DIRETA COM SAÍDA
+
+                // Conexão paralela para análise
+                gainNode.connect(analyserNode);
+                analyserNode.connect(processor);
+                processor.connect(destinationNode); // ← TAMBÉM CONECTA À SAÍDA
+            }
+
+            recordedChunks = [];
+            mediaRecorder = new MediaRecorder(mediaStream);
+            mediaRecorder.ondataavailable = (event) => {
+                if (event.data.size > 0) recordedChunks.push(event.data);
+            };
+            mediaRecorder.start(100);
+
+            isRecording = true;
+            console.log("🔊 Gravação iniciada - Áudio conectado à saída");
+            console.log("AudioContext state:", audioContext.state);
+            resolve("success");
+        } catch (error) {
+            console.error("Erro em startWebRecording:", error);
+            resolve("error: " + error.message);
+        }
+    });
+};
+
+// Função para debug das conexões de áudio
+window.debugAudioConnections = function() {
+    if (!audioContext) return "AudioContext não inicializado";
+
+    console.log("=== DEBUG ÁUDIO ===");
+    console.log("AudioContext state:", audioContext.state);
+    console.log("isRecording:", isRecording);
+    console.log("gainNode:", gainNode ? "Conectado" : "Nulo");
+    console.log("sourceNode:", sourceNode ? "Conectado" : "Nulo");
+
+    if (gainNode && gainNode.numberOfOutputs > 0) {
+        console.log("GainNode conectado a:", gainNode.numberOfOutputs, "destinos");
+    }
+
+    return "Debug completo";
+};
+
+// Função para verificar se há dados PCM disponíveis
+window.hasPcmData = function() {
+    return audioBufferData.length > 0;
+};
+
+// Função corrigida para retornar objeto simples
+window.getPcmStats = function() {
+    const totalSamples = audioBufferData.reduce((sum, buf) => sum + buf.length, 0);
+    return {
+        buffers: audioBufferData.length,
+        totalSamples: totalSamples,
+        duration: (totalSamples / 8000).toFixed(2) + ' segundos',
+        sampleRate: 8000
+    };
+};
+// Função para salvar dados PCM como WAV
+window.savePcmAsWav = function(fileName) {
+    return new Promise((resolve, reject) => {
+        try {
+            if (audioBufferData.length === 0) {
+                resolve("error: no PCM data available");
+                return;
+            }
+
+            // Combinar todos os buffers PCM
+            const totalSamples = audioBufferData.reduce((sum, buffer) => sum + buffer.length, 0);
+            const pcmData = new Float32Array(totalSamples);
+
+            let offset = 0;
+            for (const buffer of audioBufferData) {
+                pcmData.set(buffer, offset);
+                offset += buffer.length;
+            }
+
+            // Converter para WAV
+            const wavBlob = float32ToWav(pcmData, 8000);
+
+            // Download
+            const url = URL.createObjectURL(wavBlob);
+            const a = document.createElement('a');
+            a.href = url;
+            a.download = `${fileName}.wav`;
+            a.click();
+            URL.revokeObjectURL(url);
+
+            resolve("success");
+        } catch (error) {
+            resolve("error: " + error.message);
+        }
+    });
+};
+
+// FUNÇÃO AUXILIAR QUE ESTAVA FALTANDO
+function writeString(view, offset, string) {
+    for (let i = 0; i < string.length; i++) {
+        view.setUint8(offset + i, string.charCodeAt(i));
+    }
+}
+
+// AGORA SIM a função float32ToWav
+function float32ToWav(pcmData, sampleRate) {
+    const buffer = new ArrayBuffer(44 + pcmData.length * 2);
+    const view = new DataView(buffer);
+
+    // WAV header
+    writeString(view, 0, 'RIFF');
+    view.setUint32(4, 36 + pcmData.length * 2, true);
+    writeString(view, 8, 'WAVE');
+    writeString(view, 12, 'fmt ');
+    view.setUint32(16, 16, true);
+    view.setUint16(20, 1, true);
+    view.setUint16(22, 1, true);
+    view.setUint32(24, sampleRate, true);
+    view.setUint32(28, sampleRate * 2, true);
+    view.setUint16(32, 2, true);
+    view.setUint16(34, 16, true);
+    writeString(view, 36, 'data');
+    view.setUint32(40, pcmData.length * 2, true);
+
+    // PCM data
+    let offset = 44;
+    for (let i = 0; i < pcmData.length; i++) {
+        const sample = Math.max(-1, Math.min(1, pcmData[i]));
+        view.setInt16(offset, sample < 0 ? sample * 0x8000 : sample * 0x7FFF, true);
+        offset += 2;
+    }
+
+    return new Blob([buffer], { type: 'audio/wav' });
+}
+window.saveAsCsv = function(fileName) {
+    return new Promise((resolve, reject) => {
+        try {
+            console.log("=== INICIANDO saveAsCsv ===");
+            console.log("audioBufferData length:", audioBufferData.length);
+
+            if (!audioBufferData || audioBufferData.length === 0) {
+                console.log("ERRO: audioBufferData vazio");
+                resolve("error: no PCM data available");
+                return;
+            }
+
+            const totalSamples = audioBufferData.reduce((sum, buffer) => sum + buffer.length, 0);
+            console.log("Total de samples:", totalSamples);
+
+            if (totalSamples === 0) {
+                console.log("ERRO: totalSamples é zero");
+                resolve("error: no PCM samples available");
+                return;
+            }
+
+            const pcmData = new Float32Array(totalSamples);
+            let offset = 0;
+
+            console.log("Copiando dados para Float32Array...");
+            for (const buffer of audioBufferData) {
+                pcmData.set(buffer, offset);
+                offset += buffer.length;
+            }
+
+            console.log("Convertendo para CSV...");
+            const csvContent = convertPcmToCsv(pcmData);
+            console.log("CSV gerado, tamanho:", csvContent.length, "caracteres");
+
+            console.log("Criando blob...");
+            const blob = new Blob([csvContent], { type: 'text/csv;charset=utf-8;' });
+
+            console.log("Iniciando download...");
+            const url = URL.createObjectURL(blob);
+            const a = document.createElement('a');
+            a.href = url;
+            a.download = `${fileName}.csv`;
+            a.click();
+            URL.revokeObjectURL(url);
+
+            console.log("=== saveAsCsv CONCLUÍDO ===");
+            resolve("success");
+
+        } catch (error) {
+            console.error("ERRO em saveAsCsv:", error);
+            resolve("error: " + error.message);
+        }
+    });
+};
+
+// Função para salvar tanto WAV quanto CSV
+window.saveRecordingWithFormats = function(fileName) {
+    return new Promise(async (resolve, reject) => {
+        try {
+            // Salvar WAV
+            const wavResult = await savePcmAsWav(fileName);
+            if (wavResult !== "success") {
+                resolve(wavResult);
+                return;
+            }
+
+            // Salvar CSV
+            const csvResult = await saveAsCsv(fileName);
+            if (csvResult !== "success") {
+                resolve(csvResult);
+                return;
+            }
+
+            resolve("success");
+        } catch (error) {
+            resolve("error: " + error.message);
+        }
+    });
+};
+
+// Função CORRIGIDA para converter PCM para CSV
+function convertPcmToCsv(pcmData) {
+    const rows = [];
+
+    console.log("📊 Convertendo PCM para CSV...");
+    console.log("Amostras PCM:", pcmData.length);
+    console.log("Primeiras 5 amostras:", pcmData.slice(0, 5));
+
+    for (let i = 0; i < pcmData.length; i++) {
+        // Dados PCM já estão em Float32 (-1.0 a 1.0)
+        const floatSample = pcmData[i];
+
+        // Converter Float32 para Int16 (-32768 a 32767)
+        // MULTIPLICAR por 32767 (não 0x7FFF/0x8000)
+        let int16Sample;
+        if (floatSample >= 0) {
+            int16Sample = Math.round(floatSample * 32767);
+        } else {
+            int16Sample = Math.round(floatSample * 32768);
+        }
+
+        // Garantir que está no range correto
+        int16Sample = Math.max(-32768, Math.min(32767, int16Sample));
+
+        // Aplicar a transformação: ((sample + 32768) >> 4)
+        const processed = ((int16Sample + 32768) >> 4);
+
+        rows.push([processed]);
+
+        // Debug das primeiras amostras
+        if (i < 5) {
+            console.log(`Amostra ${i}: Float=${floatSample.toFixed(6)}, Int16=${int16Sample}, Processed=${processed}`);
+        }
+    }
+
+    console.log("📈 Estatísticas CSV:");
+    console.log(" - Total de linhas:", rows.length);
+    console.log(" - Primeiros valores:", rows.slice(0, 5).map(r => r[0]));
+
+    return rows.map(row => row.join(',')).join('\n');
+}
+
+// Alternativa: Converter dados brutos do MediaRecorder para CSV
+window.saveRawAsCsv = function(fileName) {
+    return new Promise(async (resolve, reject) => {
+        try {
+            if (recordedChunks.length === 0) {
+                resolve("error: no recording data");
+                return;
+            }
+
+            // Obter dados brutos do WebM
+            const audioBlob = new Blob(recordedChunks, { type: 'audio/webm' });
+            const arrayBuffer = await audioBlob.arrayBuffer();
+
+            // Decodificar para obter dados PCM
+            const audioContext = new AudioContext({ sampleRate: 8000 });
+            const audioBuffer = await audioContext.decodeAudioData(arrayBuffer);
+            const pcmData = audioBuffer.getChannelData(0); // Canal 0
+
+            // Converter para CSV
+            const csvContent = convertPcmToCsv(pcmData);
+
+            // Baixar
+            const blob = new Blob([csvContent], { type: 'text/csv;charset=utf-8;' });
+            const url = URL.createObjectURL(blob);
+            const a = document.createElement('a');
+            a.href = url;
+            a.download = `${fileName}.csv`;
+            a.click();
+            URL.revokeObjectURL(url);
+
+            resolve("success");
+        } catch (error) {
+            resolve("error: " + error.message);
+        }
+    });
+};
+
+// CORRIJA TAMBÉM saveRecording
+window.saveRecording = function(fileName) {
+    return new Promise((resolve, reject) => {
+        try {
+            if (recordedChunks.length === 0) {
+                resolve("error: no recording data");
+                return;
+            }
+
+            const blob = new Blob(recordedChunks, { type: 'audio/webm' });
+            const url = URL.createObjectURL(blob);
+            const a = document.createElement('a');
+            a.href = url;
+            a.download = `${fileName}.webm`;
+            a.click();
+            URL.revokeObjectURL(url);
+
+            resolve("success"); // ← Resolve a Promise
+        } catch (error) {
+            resolve("error: " + error.message); // ← Resolve com erro
+        }
+    });
+};
+// CORREÇÃO: getWaveformData deve estar no escopo global
+window.getWaveformData = function() {
+    if (!analyserNode || audioContextClosed) {
+        console.log("AnalyserNode não disponível");
+        return [];
+    }
+
+    try {
+        const dataArray = new Uint8Array(analyserNode.frequencyBinCount);
+        analyserNode.getByteTimeDomainData(dataArray);
+
+        // Converter para valores entre -1 e 1
+        const waveform = new Float32Array(dataArray.length);
+        for (let i = 0; i < dataArray.length; i++) {
+            waveform[i] = (dataArray[i] - 128) / 128;
+        }
+        return Array.from(waveform);
+    } catch (error) {
+        console.log("getWaveformData error:", error);
+        return [];
+    }
+};
+    window.setGain = function(gainValue) {
+        if (gainNode && !audioContextClosed) {
+            gainNode.gain.value = gainValue;
+        }
+    };
+
+
+// Função para obter dados filtrados para o gráfico
+window.getFilteredAudioData = function(lowFreq, highFreq) {
+    try {
+        console.log("=== getFilteredAudioData chamada ===");
+
+        if (!audioBufferData || audioBufferData.length === 0) {
+            console.log("Nenhum dado PCM disponível para o gráfico");
+            return [];
+        }
+
+        // Combinar todos os buffers PCM
+        const totalSamples = audioBufferData.reduce((sum, buffer) => sum + buffer.length, 0);
+        const pcmData = new Float32Array(totalSamples);
+
+        let offset = 0;
+        for (const buffer of audioBufferData) {
+            pcmData.set(buffer, offset);
+            offset += buffer.length;
+        }
+
+        console.log(`Processando ${pcmData.length} samples para o gráfico`);
+
+        // Reduzir dados para o gráfico (amostrar a cada 100 pontos para performance)
+        const reductionFactor = Math.max(1, Math.floor(pcmData.length / 1000));
+        const chartData = [];
+
+        for (let i = 0; i < pcmData.length; i += reductionFactor) {
+            const time = i / 8000; // tempo em segundos (sample rate 8000)
+            const amplitude = Math.abs(pcmData[i]) * 1000; // escalar para melhor visualização
+
+            chartData.push({
+                time: parseFloat(time.toFixed(3)),
+                amplitude: parseFloat(amplitude.toFixed(2))
+            });
+        }
+
+        console.log(`Grágico gerado com ${chartData.length} pontos`);
+        return chartData;
+
+    } catch (error) {
+        console.error("Erro em getFilteredAudioData:", error);
+        return [];
+    }
+};
+
+// Função para obter dados de áudio normal (sem filtro)
+// Função para obter dados de áudio ORIGINAL
+window.getAudioDataForChart = function() {
+    try {
+        console.log("=== getAudioDataForChart chamada ===");
+
+        if (!audioBufferData || audioBufferData.length === 0) {
+            console.log("Nenhum dado PCM disponível para o gráfico");
+            return [];
+        }
+
+        // Combinar todos os buffers PCM
+        const totalSamples = audioBufferData.reduce((sum, buffer) => sum + buffer.length, 0);
+        const pcmData = new Float32Array(totalSamples);
+
+        let offset = 0;
+        for (const buffer of audioBufferData) {
+            pcmData.set(buffer, offset);
+            offset += buffer.length;
+        }
+
+        console.log(`Processando ${pcmData.length} samples para o gráfico`);
+
+        const chartData = [];
+        const sampleRate = 8000;
+        const blockSize = 40; // Equivalente ao seu blockSize (5ms em 8kHz)
+
+        // ✅ MESMA LÓGICA DO SEU CÓDIGO DART
+        for (let i = blockSize; i < pcmData.length; i += blockSize) {
+            const windowEnd = Math.min(i + blockSize, pcmData.length);
+            const block = pcmData.slice(i, windowEnd);
+
+            if (block.length === 0) continue;
+
+            // Calcula a média do bloco (igual seu código Dart)
+            const sum = block.reduce((a, b) => a + b, 0);
+            const avg = sum / block.length;
+
+            const timeInSeconds = i / sampleRate;
+
+            chartData.push({
+                time: parseFloat(timeInSeconds.toFixed(3)),
+                amplitude: parseFloat(avg.toFixed(6)) // Mantém como float
+            });
+        }
+
+        console.log(`Gráfico gerado com ${chartData.length} pontos`);
+        console.log("Primeiros pontos:", chartData.slice(0, 3));
+        return chartData;
+
+    } catch (error) {
+        console.error("Erro em getAudioDataForChart:", error);
+        return [];
+    }
+};
+
+  </script>
+</head>
+<body>
+<!-- O SCRIPT DO FLUTTER DEVE VIR DEPOIS -->
+<script src="main.dart.js" type="application/javascript"></script>
+</body>
+</html>
